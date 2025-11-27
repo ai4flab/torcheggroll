@@ -1,5 +1,9 @@
 # TorchEggroll
 
+[![PyPI version](https://badge.fury.io/py/torcheggroll.svg)](https://pypi.org/project/torcheggroll/)
+[![Tests](https://github.com/ai4flab/torcheggroll/actions/workflows/test.yml/badge.svg)](https://github.com/ai4flab/torcheggroll/actions/workflows/test.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+
 EggRoll-style Evolution Strategies with low-rank noise for PyTorch.
 
 TorchEggroll provides a simple, efficient Evolution Strategies (ES) optimizer for PyTorch models. It uses low-rank noise for matrix parameters, reducing variance in gradient estimates while maintaining computational efficiency.
