@@ -584,3 +584,162 @@ class TorchEggrollES:
                 obj = getattr(obj, part)
             param = getattr(obj, parts[-1])
             param.data.copy_(self.base_params[name])
+
+    # ============================================================
+    # Async-friendly API for custom evaluation
+    # ============================================================
+
+    def prepare_population(self) -> List[Dict[str, Tensor]]:
+        """
+        Generate perturbed parameters for the population without evaluation.
+
+        This is the first half of the async-friendly API. It generates
+        perturbed parameters that can be evaluated externally (e.g., with
+        async LLM calls or custom fitness functions).
+
+        Returns:
+            List of parameter dicts, one per population member.
+            Each dict maps param_name -> perturbed param tensor.
+
+        Example:
+            >>> population = es.prepare_population()
+            >>> # Evaluate population externally
+            >>> fitnesses = await evaluate_with_llm(model, population, batch)
+            >>> mean_fitness = es.apply_fitness_scores(fitnesses)
+        """
+        self._refresh_base()
+
+        # Generate noise
+        self._current_noise = self._generate_all_noise()
+
+        # Build stacked params
+        self._current_stacked_params: Dict[str, Tensor] = {}
+        for name in self.param_names:
+            base = self.base_params[name]
+            noise = self._current_noise[name]
+            self._current_stacked_params[name] = base.unsqueeze(0) + noise
+
+        # For non-evolved params, just repeat
+        for name, p in self.model.named_parameters():
+            if name not in self._current_stacked_params:
+                self._current_stacked_params[name] = p.detach().unsqueeze(0).expand(
+                    self.pop_size, *p.shape
+                )
+
+        # Include buffers
+        for name, b in self.model.named_buffers():
+            self._current_stacked_params[name] = b.unsqueeze(0).expand(
+                self.pop_size, *b.shape
+            )
+
+        # Return as list of dicts (one per population member)
+        population = []
+        for i in range(self.pop_size):
+            member_params = {
+                name: params[i] for name, params in self._current_stacked_params.items()
+            }
+            population.append(member_params)
+
+        return population
+
+    def get_stacked_params(self) -> Dict[str, Tensor]:
+        """
+        Get stacked parameters for vmap-style evaluation.
+
+        Call after prepare_population(). Returns params stacked as
+        (pop_size, *param_shape) for use with torch.vmap.
+
+        Returns:
+            Dict mapping param_name -> (pop_size, *shape) tensor
+
+        Example:
+            >>> population = es.prepare_population()
+            >>> stacked = es.get_stacked_params()
+            >>> # Use with vmap
+            >>> batched_forward = vmap(lambda *p: functional_call(model, dict(zip(names, p)), (x,)))
+            >>> outputs = batched_forward(*stacked.values())
+        """
+        if not hasattr(self, '_current_stacked_params'):
+            raise RuntimeError("Call prepare_population() first")
+        return self._current_stacked_params
+
+    def apply_fitness_scores(self, fitnesses: Tensor) -> float:
+        """
+        Apply externally-computed fitness scores and update parameters.
+
+        This is the second half of the async-friendly API. It takes
+        fitness scores computed externally and performs the ES gradient
+        update.
+
+        Args:
+            fitnesses: (pop_size,) tensor of fitness scores (higher is better)
+
+        Returns:
+            Mean fitness across the population.
+
+        Example:
+            >>> population = es.prepare_population()
+            >>> fitnesses = await custom_evaluate(population)
+            >>> mean_fitness = es.apply_fitness_scores(fitnesses)
+        """
+        if not hasattr(self, '_current_noise'):
+            raise RuntimeError("Call prepare_population() first")
+
+        if fitnesses.shape[0] != self.pop_size:
+            raise ValueError(
+                f"Expected {self.pop_size} fitness scores, got {fitnesses.shape[0]}"
+            )
+
+        fitnesses = fitnesses.to(self.device)
+
+        # Normalize fitnesses
+        rewards = fitnesses
+        if self.normalize_fitness:
+            std = rewards.std()
+            if std > 1e-8:
+                rewards = (rewards - rewards.mean()) / std
+            else:
+                rewards = rewards - rewards.mean()
+        else:
+            rewards = rewards - rewards.mean()
+
+        # ES gradient estimate and update
+        with torch.no_grad():
+            for name in self.param_names:
+                noise = self._current_noise[name]  # (pop_size, *shape)
+                expanded_rewards = rewards.view(
+                    self.pop_size, *([1] * (noise.ndim - 1))
+                )
+                grad = (expanded_rewards * noise).mean(dim=0) * (self.pop_size ** 0.5)
+                self.base_params[name] = self.base_params[name] + self.lr * grad
+
+        # Copy updated params back to model
+        self._update_model_params()
+
+        # Clean up
+        del self._current_noise
+        del self._current_stacked_params
+
+        self.epoch += 1
+        return float(fitnesses.mean().item())
+
+    def state_dict(self) -> Dict[str, any]:
+        """Return optimizer state for checkpointing."""
+        return {
+            "epoch": self.epoch,
+            "base_params": {k: v.cpu() for k, v in self.base_params.items()},
+            "param_names": self.param_names,
+            "param_shapes": self.param_shapes,
+            "pop_size": self.pop_size,
+            "sigma": self.sigma,
+            "lr": self.lr,
+            "rank": self.rank,
+        }
+
+    def load_state_dict(self, state: Dict[str, any]) -> None:
+        """Load optimizer state from checkpoint."""
+        self.epoch = state["epoch"]
+        self.base_params = {
+            k: v.to(self.device) for k, v in state["base_params"].items()
+        }
+        self._update_model_params()
