@@ -23,9 +23,10 @@ def generate_lora_noise_batched(
     rank: int,
     sigma: float,
     pop_size: int,
-    seeds: Tensor,
+    seeds: Optional[Tensor],
     device: torch.device,
     dtype: torch.dtype,
+    fast: bool = True,
 ) -> Tensor:
     """
     Generate batched low-rank noise for a 2D parameter (matrix).
@@ -40,9 +41,11 @@ def generate_lora_noise_batched(
         rank: The rank of the low-rank noise
         sigma: The noise scale
         pop_size: Number of population members
-        seeds: (pop_size,) tensor of seeds for each member
+        seeds: (pop_size,) tensor of seeds for each member (ignored if fast=True)
         device: Device to generate noise on
         dtype: Data type for noise
+        fast: If True, use batched generation (faster). If False, use per-member
+              seeds for reproducibility (slower but each member is reproducible).
 
     Returns:
         (pop_size, out_dim, in_dim) batched noise tensor
@@ -50,32 +53,40 @@ def generate_lora_noise_batched(
     out_dim, in_dim = shape
     r = min(rank, out_dim, in_dim)
 
-    # Generate all A and B factors at once
-    # We use the seeds to create deterministic but different noise per member
-    total_elements = (out_dim + in_dim) * r
-
-    # Create batched random noise using seeds
-    # For reproducibility, we generate sequentially but store batched
-    all_noise = []
-    for i in range(pop_size):
-        gen = torch.Generator(device=device)
-        gen.manual_seed(int(seeds[i].item()))
-        lora_params = torch.randn(out_dim + in_dim, r, generator=gen, device=device, dtype=dtype)
-        B = lora_params[:in_dim]   # (in_dim, r)
-        A = lora_params[in_dim:]   # (out_dim, r)
-        noise = (A @ B.t()) * (sigma / (r ** 0.5))
-        all_noise.append(noise)
-
-    return torch.stack(all_noise, dim=0)  # (pop_size, out_dim, in_dim)
+    if fast:
+        # Fast path: single batched randn call + batched matmul
+        lora_params = torch.randn(
+            pop_size, out_dim + in_dim, r, device=device, dtype=dtype
+        )
+        B = lora_params[:, :in_dim, :]      # (pop_size, in_dim, r)
+        A = lora_params[:, in_dim:, :]      # (pop_size, out_dim, r)
+        # Batched matmul: (pop_size, out_dim, r) @ (pop_size, r, in_dim)
+        noise = torch.bmm(A, B.transpose(1, 2)) * (sigma / (r ** 0.5))
+        return noise  # (pop_size, out_dim, in_dim)
+    else:
+        # Slow path: per-member seeds for reproducibility
+        if seeds is None:
+            raise ValueError("seeds required when fast=False")
+        all_noise = []
+        for i in range(pop_size):
+            gen = torch.Generator(device=device)
+            gen.manual_seed(int(seeds[i].item()))
+            lora_params = torch.randn(out_dim + in_dim, r, generator=gen, device=device, dtype=dtype)
+            B = lora_params[:in_dim]   # (in_dim, r)
+            A = lora_params[in_dim:]   # (out_dim, r)
+            noise = (A @ B.t()) * (sigma / (r ** 0.5))
+            all_noise.append(noise)
+        return torch.stack(all_noise, dim=0)  # (pop_size, out_dim, in_dim)
 
 
 def generate_standard_noise_batched(
     shape: Tuple[int, ...],
     sigma: float,
     pop_size: int,
-    seeds: Tensor,
+    seeds: Optional[Tensor],
     device: torch.device,
     dtype: torch.dtype,
+    fast: bool = True,
 ) -> Tensor:
     """
     Generate batched standard Gaussian noise for non-matrix parameters.
@@ -84,21 +95,29 @@ def generate_standard_noise_batched(
         shape: Shape of the parameter
         sigma: The noise scale
         pop_size: Number of population members
-        seeds: (pop_size,) tensor of seeds
+        seeds: (pop_size,) tensor of seeds (ignored if fast=True)
         device: Device to generate noise on
         dtype: Data type for noise
+        fast: If True, use batched generation (faster). If False, use per-member
+              seeds for reproducibility (slower but each member is reproducible).
 
     Returns:
         (pop_size, *shape) batched noise tensor
     """
-    all_noise = []
-    for i in range(pop_size):
-        gen = torch.Generator(device=device)
-        gen.manual_seed(int(seeds[i].item()))
-        noise = torch.randn(shape, generator=gen, device=device, dtype=dtype) * sigma
-        all_noise.append(noise)
-
-    return torch.stack(all_noise, dim=0)  # (pop_size, *shape)
+    if fast:
+        # Fast path: single batched randn call
+        return torch.randn(pop_size, *shape, device=device, dtype=dtype) * sigma
+    else:
+        # Slow path: per-member seeds for reproducibility
+        if seeds is None:
+            raise ValueError("seeds required when fast=False")
+        all_noise = []
+        for i in range(pop_size):
+            gen = torch.Generator(device=device)
+            gen.manual_seed(int(seeds[i].item()))
+            noise = torch.randn(shape, generator=gen, device=device, dtype=dtype) * sigma
+            all_noise.append(noise)
+        return torch.stack(all_noise, dim=0)  # (pop_size, *shape)
 
 
 # Keep old functions for backwards compatibility
@@ -336,6 +355,7 @@ class TorchEggrollES:
         param_filter: Optional[Callable[[nn.Parameter, str], bool]] = None,
         normalize_fitness: bool = True,
         antithetic: bool = True,
+        fast_noise: bool = True,
     ) -> None:
         """
         Initialize the ES optimizer.
@@ -351,6 +371,8 @@ class TorchEggrollES:
                           to include in ES updates.
             normalize_fitness: If True, z-score fitnesses; else only mean-center.
             antithetic: If True, use antithetic (mirrored) sampling for lower variance.
+            fast_noise: If True (default), use fast batched noise generation.
+                        If False, use per-member seeded generation for reproducibility.
         """
         self.model = model
         self.pop_size = pop_size
@@ -359,6 +381,7 @@ class TorchEggrollES:
         self.rank = rank
         self.normalize_fitness = normalize_fitness
         self.antithetic = antithetic
+        self.fast_noise = fast_noise
 
         if antithetic and pop_size % 2 != 0:
             raise ValueError("pop_size must be even when using antithetic sampling")
@@ -420,33 +443,41 @@ class TorchEggrollES:
         pop_size = self.pop_size
         device = self.device
 
-        # For antithetic sampling, we only need half the seeds
+        # For antithetic sampling, we only need half the noise
         if self.antithetic:
-            n_seeds = pop_size // 2
+            n_members = pop_size // 2
         else:
-            n_seeds = pop_size
+            n_members = pop_size
 
         all_noise = {}
+
+        # For fast path, seed once per step for step-level reproducibility
+        if self.fast_noise:
+            torch.manual_seed(self.epoch * 31337)
 
         for idx, name in enumerate(self.param_names):
             shape = self.param_shapes[idx]
             dtype = self.param_dtypes[idx]
 
-            # Generate seeds for this parameter
-            seeds = torch.tensor(
-                [hash((self.epoch, i, idx)) & 0x7FFFFFFF for i in range(n_seeds)],
-                device=device,
-                dtype=torch.long
-            )
+            # Generate seeds only if using slow path
+            seeds = None
+            if not self.fast_noise:
+                seeds = torch.tensor(
+                    [hash((self.epoch, i, idx)) & 0x7FFFFFFF for i in range(n_members)],
+                    device=device,
+                    dtype=torch.long
+                )
 
             # Generate noise
             if len(shape) == 2:
                 noise = generate_lora_noise_batched(
-                    shape, self.rank, self.sigma, n_seeds, seeds, device, dtype
+                    shape, self.rank, self.sigma, n_members, seeds, device, dtype,
+                    fast=self.fast_noise
                 )
             else:
                 noise = generate_standard_noise_batched(
-                    shape, self.sigma, n_seeds, seeds, device, dtype
+                    shape, self.sigma, n_members, seeds, device, dtype,
+                    fast=self.fast_noise
                 )
 
             # For antithetic: duplicate and negate

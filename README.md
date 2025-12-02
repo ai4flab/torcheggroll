@@ -92,6 +92,17 @@ TorchEggrollES(
   - `targets`: Target tensor for supervised learning
   - Returns mean fitness across population (negated loss, so higher is better)
 
+**Async-Friendly API** (for custom evaluation, e.g., with LLM calls):
+
+- `prepare_population() -> List[Dict[str, Tensor]]`: Generate perturbed parameters without evaluation
+- `get_stacked_params() -> Dict[str, Tensor]`: Get params stacked as (pop_size, *shape) for vmap
+- `apply_fitness_scores(fitnesses: Tensor) -> float`: Apply fitness scores and update parameters
+
+**Checkpointing:**
+
+- `state_dict() -> Dict`: Return optimizer state for checkpointing
+- `load_state_dict(state: Dict)`: Load optimizer state from checkpoint
+
 ### Utility Functions
 
 **Low-level noise generation:**
@@ -131,6 +142,69 @@ rewards = torch.randn(32)  # fitness per population member
 # Compute gradients
 grads = compute_es_gradient(noise, rewards)
 # grads["W1"] shape: (20, 10) - same as original param
+```
+
+## Async-Friendly API
+
+For custom evaluation (e.g., with async LLM calls or external fitness functions), use the two-step API:
+
+```python
+import torch
+from torcheggroll import TorchEggrollES
+
+model = nn.Linear(10, 5)
+es = TorchEggrollES(model, pop_size=32, sigma=0.1, lr=0.1)
+
+# Step 1: Generate perturbed parameters
+population = es.prepare_population()
+# population is List[Dict[str, Tensor]], one dict per population member
+
+# Step 2: Evaluate externally (your custom logic)
+fitnesses = []
+for params in population:
+    # Custom evaluation - could be async LLM calls, etc.
+    output = torch.func.functional_call(model, params, (inputs,))
+    fitness = your_custom_fitness_fn(output)
+    fitnesses.append(fitness)
+fitnesses = torch.tensor(fitnesses)
+
+# Step 3: Apply fitness scores and update
+mean_fitness = es.apply_fitness_scores(fitnesses)
+```
+
+For vmap-style parallel evaluation:
+
+```python
+# Get stacked params for vmap
+population = es.prepare_population()
+stacked = es.get_stacked_params()  # Dict[name -> (pop_size, *shape)]
+
+# Use vmap for parallel evaluation
+from torch.func import vmap, functional_call
+
+batched_forward = vmap(
+    lambda *p: functional_call(model, dict(zip(stacked.keys(), p)), (inputs,)),
+    in_dims=tuple(0 for _ in stacked)
+)
+all_outputs = batched_forward(*stacked.values())  # (pop_size, batch, ...)
+
+# Compute fitness and apply
+fitnesses = compute_fitness(all_outputs, targets)
+mean_fitness = es.apply_fitness_scores(fitnesses)
+```
+
+## Checkpointing
+
+Save and restore optimizer state:
+
+```python
+# Save
+state = es.state_dict()
+torch.save(state, "checkpoint.pt")
+
+# Load
+state = torch.load("checkpoint.pt")
+es.load_state_dict(state)
 ```
 
 ## Examples
